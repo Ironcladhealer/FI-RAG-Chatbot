@@ -1,15 +1,19 @@
+
 import {DataAPIClient} from '@datastax/astra-db-ts'
 import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { GoogleGenAI } from '@google/genai'; 
-// import OpenAI from "openai"; 
+import { GoogleGenAI } from '@google/genai';
+import OpenAI from "openai";
 
 import "dotenv/config";
+import { text } from 'stream/consumers';
+import { create } from 'domain';
+
 type SimilarityMetric = "dot_product" | "cosine" | "euclidean";
 
-const {ASTRA_DB_ENDPOINT, ASTRA_DB_TOKEN, ASTRA_DB_NAME, ASTRA_DB_COLLECTION, GEMINI_API} = process.env;
+const {ASTRA_DB_ENDPOINT, ASTRA_DB_TOKEN, ASTRA_DB_NAME, ASTRA_DB_COLLECTION, GEMINI_API, OPENAI_API} = process.env;
 
-const ai = new GoogleGenAI({ apiKey: GEMINI_API });
+const ai = new OpenAI({apiKey: OPENAI_API });
 
 const f1Data = [
     "https://en.wikipedia.org/wiki/Formula_One",
@@ -20,7 +24,6 @@ const f1Data = [
 ]
 
 const client = new DataAPIClient(ASTRA_DB_TOKEN);
-
 const db = client.db(ASTRA_DB_ENDPOINT, {namespace: ASTRA_DB_NAME});
 
 const split = new RecursiveCharacterTextSplitter({
@@ -32,7 +35,7 @@ const createCollection = async (SimilarityMetric: SimilarityMetric = "dot_produc
     try {
         const res = await db.createCollection(ASTRA_DB_COLLECTION, {
             vector: {
-                dimension: 768, 
+                dimension: 1536,
                 metric: SimilarityMetric
             }
         });
@@ -49,26 +52,23 @@ const createCollection = async (SimilarityMetric: SimilarityMetric = "dot_produc
 const loadSampleData = async () => {
     const collection = await db.collection(ASTRA_DB_COLLECTION);
     for await (const url of f1Data) {
-        console.log(`Scraping and processing: ${url}`);
         const content = await scrapePage(url);
         const chunks = await split.splitText(content);
-
         for (const chunk of chunks) {
-            const embeddingResponse = await ai.models.embedContent({
-                model: "text-embedding-004", 
-                contents: chunk,
-            });
-            
-            const vector = embeddingResponse.embeddings[0].values;
-            
+            const embedding = await ai.embeddings.create({
+                model: "text-embedding-3-small",
+                input: chunk,
+                encoding_format: "float"
+            })
+            const vector = embedding.data[0].embedding
+
             const res = await collection.insertOne({
                 $vector: vector,
                 text: chunk 
             })
-            console.log(`Inserted chunk: ${res.insertedId}`);
+            console.log(res);
         }
-    }
-    console.log("Data loading complete.");
+}
 }
 
 const scrapePage = async (url: string) => {
@@ -80,16 +80,12 @@ const scrapePage = async (url: string) => {
             waitUntil: "domcontentloaded"
         },
         evaluate: async(page, browser) => {
-            // Note: Puppeteer is resource-intensive and might require additional environment setup.
-            const result = await page.evaluate(() => document.body.innerText); // Using innerText for cleaner text extraction
+            const result = await page.evaluate(() => document.body.innerHTML);
             await browser.close();
             return result;
         }
     })
-    // Scrape and clean up excessive whitespace
-    const docs = await loader.load();
-    return docs.map(doc => doc.pageContent).join('\n').replace(/\s+/g, ' ') || '';
+    return (await loader.scrape())?.replace(/\s+/g, ' ') || '';
 }
 
-// Execute the functions
-createCollection().then(() => loadSampleData());
+createCollection().then(() => loadSampleData())
